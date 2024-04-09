@@ -5,89 +5,22 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-
-# Helper function to support different mask shapes.
-# Output shape supports (batch_size, number of heads, seq length, seq length)
-# If 2D: broadcasted over batch size and number of heads
-# If 3D: broadcasted over number of heads
-# If 4D: leave as is
-def expand_mask(mask):
-    assert mask.ndim > 2, "Mask must be at least 2-dimensional with seq_length x seq_length"
-    if mask.ndim == 3:
-        mask = mask.unsqueeze(1)
-    while mask.ndim < 4:
-        mask = mask.unsqueeze(0)
-    return mask
-
-def scaled_dot_product(q, k, v, dropout = 0.1, mask=None):
-    d_k = q.shape[-1]
-    attn_logits = jnp.matmul(q, jnp.swapaxes(k, -2, -1))
-    attn_logits = attn_logits / math.sqrt(d_k)
-    if mask is not None:
-        attn_logits = jnp.where(mask == 0, -9e15, attn_logits)
-    attention = nn.softmax(attn_logits, axis=-1)
-    attention = nn.Dropout(dropout)(attention)
-    values = jnp.matmul(attention, v)
-    return values, attention
-
-class MultiheadAttention(nn.Module):
-    embed_dim : int  # Output dimension
-    num_heads : int  # Number of parallel heads (h)
-    drop_out: float
+## Helper 
+class MLP(nn.Module):
+    num_layers: int
+    hidden_dim: int
+    output_dim: int
+    num_layers: int
+    act: callable = jax.nn.relu
 
     def setup(self):
-        # Stack all weight matrices 1...h and W^Q, W^K, W^V together for efficiency
-        # Note that in many implementations you see "bias=False" which is optional
-        self.qkv_proj = nn.Dense(3*self.embed_dim,
-                                 kernel_init=nn.initializers.xavier_uniform(),  # Weights with Xavier uniform init
-                                 bias_init=nn.initializers.zeros  # Bias init with zeros
-                                )
-        self.o_proj = nn.Dense(self.embed_dim,
-                               kernel_init=nn.initializers.xavier_uniform(),
-                               bias_init=nn.initializers.zeros)
+        feat_size = [self.hidden_dim] * (self.num_layers - 1) + [self.output_dim]
+        self.layers = [nn.Dense(s) for s in feat_size]
 
-    def __call__(self, x, mask=None, train=True):
-        batch_size, seq_length, embed_dim = x.shape
-        if mask is not None:
-            mask = expand_mask(mask)
-        qkv = self.qkv_proj(x)
-
-        # Separate Q, K, V from linear output
-        qkv = qkv.reshape(batch_size, seq_length, self.num_heads, -1)
-        qkv = qkv.transpose(0, 2, 1, 3) # [Batch, Head, SeqLen, Dims]
-        q, k, v = jnp.array_split(qkv, 3, axis=-1)
-
-        # Determine value outputs
-        values, attention = scaled_dot_product(q, k, v, drop_out = self.drop_out, mask=mask)
-        values = values.transpose(0, 2, 1, 3) # [Batch, SeqLen, Head, Dims]
-        values = values.reshape(batch_size, seq_length, embed_dim)
-        o = self.o_proj(values)
-
-        return o, attention
-
-class PositionalEncoding(nn.Module):
-    d_model : int         # Hidden dimensionality of the input.
-    max_len : int = 5000  # Maximum length of a sequence to expect.
-
-    def setup(self):
-        # Create matrix of [SeqLen, HiddenDim] representing the positional encoding for max_len inputs
-        pe = np.zeros((self.max_len, self.d_model))
-        position = np.arange(0, self.max_len, dtype=np.float32)[:,None]
-        div_term = np.exp(np.arange(0, self.d_model, 2) * (-math.log(10000.0) / self.d_model))
-        pe[:, 0::2] = np.sin(position * div_term)
-        pe[:, 1::2] = np.cos(position * div_term)
-        pe = pe[None]
-        self.pe = jax.device_put(pe)
-
-    def __call__(self, x, train=True):
-        x = x + self.pe[:, :x.shape[1]]
-        return x
-
-class PositionalEncoding2D(nn.Module):
-    w : int
-    h : int
-    d_model : int= 256
-    temperature: float = 10000.0
+    def __call__(self, x):
+        for i, layer in enumerate(self.layers):
+            x = self.act(layer(x)) if i < self.num_layers -1 else layer(x)
+        return x        
 
 def get_2d_PositionalEncoding(w, h, d_model: int = 256, temperature: float = 10000.0):
     grid_w = jnp.arange(int(w), dtype = np.float32)
@@ -103,3 +36,53 @@ def get_2d_PositionalEncoding(w, h, d_model: int = 256, temperature: float = 100
     pe = jnp.concatenate([jnp.sin(out_w), jnp.cos(out_w), jnp.sin(out_h), jnp.cos(out_h)], axis = 1)[None, :, :]
     pe = jax.device_put(pe)
     return pe
+
+
+
+## Transformer Modules
+class MSDeformableAttention(nn.Module):
+    """
+    Multi-Scale Deformable Attention Module
+    """
+    embed_dim: int = 256
+    num_heads: int = 8
+    num_levels: int = 4
+    num_points: int = 4
+
+    def setup(self):
+        self.total_points = self.num_heads * self.num_levels * self.num_points
+        self.head_dim = self.embed_dim // self.num_heads
+        assert self.head_dim * self.num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
+
+        self.sampling_offsets = nn.Dense(self.total_points * 2,)
+        self.attention_weights = nn.Dense(self.total_points)
+        self.value_proj = nn.Dense(self.embed_dim)
+        self.output_proj = nn.Dense(self.embed_dim)
+
+        # self.ms_deformable_attn_core = deformable_attention_core_func
+
+        # self._reset_parameters()
+    
+    def __call__(self, query, reference_points, value, value_spatial_shapes, value_mask=None):
+        """
+        Args:
+            query (Tensor): [bs, query_length, C]
+            reference_points (Tensor): [bs, query_length, n_levels, 2], range in [0, 1], top-left (0,0),
+                bottom-right (1, 1), including padding area
+            value (Tensor): [bs, value_length, C]
+            value_spatial_shapes (List): [n_levels, 2], [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})]
+            value_level_start_index (List): [n_levels], [0, H_0*W_0, H_0*W_0+H_1*W_1, ...]
+            value_mask (Tensor): [bs, value_length], True for non-padding elements, False for padding elements
+
+        Returns:
+            output (Tensor): [bs, Length_{query}, C]
+        """
+        bs, Len_q, _ = query.shape
+        _, Len_v, _ = value.shape
+
+        value = self.value_proj(value)
+        if value_mask is not None:
+            value_mask = jnp.expand_dims(value_mask.astype(value.dtype), dim = -1)
+            value *= value_mask
+        
+        
