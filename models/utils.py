@@ -1,4 +1,5 @@
 import jax
+from einops import rearrange
 import jax.numpy as jnp
 from flax import linen as nn
 
@@ -28,6 +29,12 @@ def deformable_attention_core_func(value, value_spatial_shapes, sampling_locatio
 
     for level, (h, w) in enumerate(value_spatial_shapes):
         # N_, H_*W_, M_, D_ -> N_, H_*W_, M_*D_ -> N_, M_*D_, H_*W_ -> N_*M_, D_, H_, W_
-        # value_l_ = value_list[level].flatten(2).permute(0, 2, 1).reshape(bs * n_head, c, h, w)
-        value_l_ = jnp.einsum('i',value_list[level])
+        value_l_ = rearrange(value_list[level], 'b (h w) nh c -> (b nh) c h w', h = h, w = w)
+
+        # N_, Lq_, M_, P_, 2 -> N_, M_, Lq_, P_, 2 -> N_*M_, Lq_, P_, 2
+        sampling_grid_l_ = rearrange(sampling_grids[:, :, :, level], 'b L n p c -> (b n) L p c')
+        x = jax.scipy.ndimage.map_coordinates
+        import torch
+        torch.nn.functional.grid_sample
+        
         pass
