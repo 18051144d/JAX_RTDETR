@@ -36,5 +36,5 @@ def deformable_attention_core_func(value, value_spatial_shapes, sampling_locatio
         x = jax.scipy.ndimage.map_coordinates
         import torch
         torch.nn.functional.grid_sample
-        
+        torch.gather
         pass
